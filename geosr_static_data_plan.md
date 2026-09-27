@@ -1,287 +1,322 @@
-# GeoSR 静态实验数据准备计划
+# GeoSR 静态实验数据准备与验证计划
 
-目标：在约 1 TB 服务器存储空间内，先完成 GeoSR 静态方向的最小可行复现实验，再做你的 geometry token layer ablation。
+## 目标与实验定位
+
+目标是在约 1 TB 可用空间内，完成一个可复现的 GeoSR-style 静态实验，并验证不同 VGGT 表示层对空间任务的影响。第一阶段属于 **controlled layer-probing study**，不是对 GeoSR 论文结果的严格复现，因为训练数据会缩小，并暂时不使用 LLaVA-Hound。
 
 核心原则：
 
-- 评测集固定使用 `VSI-Bench`。
-- 所有被比较的方法使用同一份训练子集、同一训练预算。
-- 如果训练数据和论文不同，不直接比较论文表格中的绝对分数，而比较你自己复现的 baseline 与你的方法之间的相对提升。
+- 最终评测固定使用 VSI-Bench，但不能用它选择 geometry layer、mask 参数或 checkpoint。
+- 从 SPAR 训练数据中建立 scene-disjoint development split，用于所有模型选择。
+- 所有比较方法使用完全相同的训练样本、顺序、训练步数、随机种子和评测协议。
+- 报告本地 baseline 与改动方法之间的相对变化，不把缩小数据后的绝对分数与论文表格直接比较。
+- 保存数据 manifest、输入哈希、抽样 seed、任务分布和 scene 分布。
+
+## 需要先澄清的数据事实
+
+spar_234k.json 只是 annotation，不包含训练图像。SPAR-7M 官方仓库中的 rxr.tar.gz、scannet.tar.gz、scannetpp.tar.gz 和 structured3d.tar.gz 主要包含 annotation；SPAR 官方不重新分发受第三方许可约束的原始 RGB 数据。
+
+因此不能假设下载约 3 GB 的 SPAR 压缩包后就能得到：
+
+~~~text
+spar/scannet/images/...
+spar/scannetpp/images/...
+spar/structured3d/images/...
+spar/rxr/images/...
+~~~
+
+正确做法是：
+
+1. 下载 GeoSR/VG-LLM 发布的 annotation 和 spar_7m.tar.gz。
+2. 检查压缩包成员，确认它是否真的含有 annotation 所引用的图片。
+3. 如果不包含图片，按照上游数据集许可获取数据，并使用 SPAR 官方 preparation scripts 生成所需目录结构。
+4. 先建立“media 完整的可用样本全集”，再从中抽样，避免根据缺失情况反复重抽而引入隐性偏差。
+
+官方入口：
+
+- GeoSR: https://github.com/SuhZhang/GeoSR
+- SPAR-7M: https://huggingface.co/datasets/jasonzhango/SPAR-7M
+- VG-LLM-Data: https://huggingface.co/datasets/zd11024/VG-LLM-Data
+- VSI-Bench: https://huggingface.co/datasets/nyu-visionx/VSI-Bench
+
+## 推荐目录
+
+~~~text
+/data/geosr_static/
+├── GeoSR-static/
+│   └── train/
+├── VSI-Bench/
+├── media/
+│   └── spar/
+├── models/
+├── hf_cache/
+└── manifests/
+~~~
+
+以下命令假设当前目录为：
+
+~~~bash
+cd /path/to/CVPR/VLM-3
+~~~
 
 ## 一句话流程
 
-```text
-下载公开 annotation / 评测集 / 模型 / SPAR compact media
--> 解压 SPAR compact media
--> 从 spar_234k.json 抽样得到 spar_50k.json 和 spar_50k_media.txt
--> 检查 media 覆盖率
--> 把可用 media 软链接到 GeoSR 训练目录
--> 跑 GeoSR-style baseline
--> 改 geometry layer 做 ablation
-```
+~~~text
+下载 annotation / VSI-Bench / 模型
+-> 检查发布的 SPAR 包是否包含 RGB
+-> 按上游许可准备缺失 media
+-> 对完整 annotation 做样本级 media 审计
+-> 从 media 完整全集分层抽取 55k
+-> 按 scene 划分约 50k train + 5k development
+-> 固定 manifest 和训练预算
+-> 在 development 上做 layer probing
+-> 锁定方案后仅在 VSI-Bench 上进行最终评测
+~~~
 
-## 需要准备的数据
+## 1. 下载公开文件
 
-| 优先级 | 数据 / 文件 | 用途 | 下载地址 | 已知下载大小 | 说明 |
-|---|---|---|---|---:|---|
-| 必须 | `VSI-Bench`: `test.jsonl`, `scannet.zip`, `scannetpp.zip`, `arkitscenes.zip` | 静态空间推理评测集 | https://huggingface.co/datasets/nyu-visionx/VSI-Bench | 约 5.73 GB | 固定评测集，建议完整下载。 |
-| 必须 | `VG-LLM-Data/train/spar_234k.json` | SPAR 训练 annotation | https://huggingface.co/datasets/zd11024/VG-LLM-Data/tree/main/train | 约 320 MB | 第一轮从这里抽 50k 或 100k。 |
-| 建议 | `VG-LLM-Data/train/llava_hound_64k.json` | 作者 recipe 中的 2D/video instruction 辅助数据 | 同上 | 约 28.6 MB | 第一轮可先不使用，因为会增加视频 media 准备成本。 |
-| 建议 | SPAR-7M compact media: `rxr.tar.gz`, `scannet.tar.gz`, `scannetpp.tar.gz`, `structured3d.tar.gz` | `spar_234k` 可能引用的 compact media | https://huggingface.co/datasets/jasonzhango/SPAR-7M/tree/main | 合计约 3 GB | 先下载这些包并检查覆盖率。它们不是完整原始上游数据集，而是 SPAR 处理后的 compact media。 |
-| 必须 | Qwen2.5-VL-7B + VGGT-1B | 训练和 VGGT feature 提取 | https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct / https://huggingface.co/facebook/VGGT-1B | 约 20-30 GB | 建议放在数据盘的 HF cache 中。 |
-| 可选 | LLaVA-Video-178K media | `llava_hound_64k` 对应视频/帧 | https://huggingface.co/datasets/lmms-lab/LLaVA-Video-178K | 完整约 1.28 TB | 1 TB 预算下不要完整下载。若后续使用，只下载引用子集。 |
-| 可选 | 预提取 VGGT features | 降低在线训练显存和时间 | 本地生成 | 取决于样本数和层数 | 第一轮先跑通在线版或只预提 1 层，再扩展到 3 层。 |
+脚本不会安装或升级 Python 包，也不会把 SPAR annotation archives 当作 RGB media。服务器应预先安装 Hugging Face CLI。
 
-## 重要判断：能否部分下载
-
-| 问题 | 准确答案 |
-|---|---|
-| Hugging Face 能不能只下载一部分？ | 可以，但只能按仓库中的独立文件路径下载。 |
-| 能不能只下载 `.zip` / `.tar.gz` 内部一部分样本？ | 通常不可以。必须下载整个压缩包，再解压、筛选、删除。 |
-| `spar_234k.json` 下载后是否就有训练图片？ | 没有。它是 annotation，需要准备其中引用的 media。 |
-| 是否一定要下载原始 ScanNet / ScanNet++ / Structured3D / RxR？ | 不一定。先下载 SPAR-7M Hugging Face 上的 compact media 包，检查是否覆盖你的子集；覆盖不足时再考虑原始上游数据。 |
-
-## 服务器端完整步骤
-
-下面假设服务器数据根目录为：
-
-```bash
-/data/geosr_static
-```
-
-你的代码目录为：
-
-```bash
-/path/to/CVPR
-```
-
-### 1. 下载公开数据和模型
-
-```bash
-cd /path/to/CVPR
+~~~bash
+python -m pip install -U "huggingface_hub[cli]"
 bash scripts/download_geosr_static_data.sh /data/geosr_static
-```
+~~~
 
-这个脚本会下载：
+如暂时不下载模型：
 
-```text
+~~~bash
+DOWNLOAD_MODELS=0 bash scripts/download_geosr_static_data.sh /data/geosr_static
+~~~
+
+下载内容：
+
+~~~text
 /data/geosr_static/VSI-Bench
-/data/geosr_static/GeoSR-static
-/data/geosr_static/SPAR-7M
+/data/geosr_static/GeoSR-static/train/spar_234k.json
+/data/geosr_static/GeoSR-static/train/llava_hound_64k.json
+/data/geosr_static/GeoSR-static/train/spar_7m.tar.gz
 /data/geosr_static/models
-/data/geosr_static/hf_cache
-```
+~~~
 
-### 2. 解压 SPAR compact media
+## 2. 检查发布的 SPAR 包
 
-```bash
-cd /path/to/CVPR
+~~~bash
 bash scripts/extract_spar_compact_media.sh /data/geosr_static
-```
+~~~
 
-解压目标：
+脚本会先检查 archive member：
 
-```text
-/data/geosr_static/media
-```
+- 如果发现图片且路径安全，才解压到 /data/geosr_static/media。
+- 如果没有图片，以状态码 2 退出，并明确提示该包不能作为 media。
+- 如果存在绝对路径或父目录跳转，拒绝解压。
 
-期望里面出现类似：
+没有图片不是异常结论，而是说明需要从获得授权的上游数据生成 SPAR 所需 RGB layout。不要通过非官方来源复制图片来绕过数据许可。
 
-```text
-/data/geosr_static/media/spar/scannet/...
-/data/geosr_static/media/spar/scannetpp/...
-/data/geosr_static/media/spar/structured3d/...
-/data/geosr_static/media/spar/rxr/...
-```
+## 3. 建立 media 完整样本全集
 
-如果解压后目录层级不同，先不要移动，下一步用检查脚本看覆盖率。
+上游 media 准备好后，先对完整 spar_234k.json 做样本级审计：
 
-### 3. 从 `spar_234k.json` 抽样
-
-第一轮建议先抽 50k：
-
-```bash
-cd /path/to/CVPR
-python scripts/sample_spar_subset.py \
-  --input /data/geosr_static/GeoSR-static/train/spar_234k.json \
-  --output /data/geosr_static/GeoSR-static/train/spar_50k.json \
-  --media-list /data/geosr_static/GeoSR-static/train/spar_50k_media.txt \
-  --num-samples 50000 \
-  --seed 0
-```
-
-输出：
-
-```text
-/data/geosr_static/GeoSR-static/train/spar_50k.json
-/data/geosr_static/GeoSR-static/train/spar_50k_media.txt
-```
-
-`spar_50k_media.txt` 就是这 50k 样本引用的 media 清单。
-
-### 4. 检查 SPAR compact media 是否覆盖你的子集
-
-```bash
-cd /path/to/CVPR
+~~~bash
 python scripts/check_media_availability.py \
-  --media-list /data/geosr_static/GeoSR-static/train/spar_50k_media.txt \
+  --annotation /data/geosr_static/GeoSR-static/train/spar_234k.json \
   --media-root /data/geosr_static/media \
-  --missing-output /data/geosr_static/GeoSR-static/train/spar_50k_missing_media.txt
-```
+  --missing-output /data/geosr_static/manifests/spar_234k_missing_media.txt \
+  --valid-output /data/geosr_static/GeoSR-static/train/spar_media_complete.json
+~~~
 
-你需要看输出中的：
+需要同时检查：
 
-```text
-Coverage: xx.xx%
-```
+~~~text
+Path coverage
+Sample coverage
+Incomplete samples by task
+Missing path prefixes
+~~~
 
-判断：
+实验使用的是“所有引用 media 均存在”的样本，而不是仅根据唯一文件路径覆盖率判断。如果某个数据源缺失严重，应先决定是否补齐该数据源；若受 1 TB 限制只能使用部分数据源，需要把 source restriction 写进实验名称和报告。
 
-- 如果接近 `100%`，说明 SPAR compact media 足够覆盖当前子集。
-- 如果覆盖率很低，先检查目录层级是否多了一层或少了一层。
-- 如果目录层级正确但仍大量缺失，说明当前子集引用了 compact media 没覆盖的路径，需要换抽样策略、缩小子集，或准备更多上游 media。
+## 4. 分层抽取候选子集
 
-### 5. 查看子集引用了哪些数据源
+从 media 完整全集抽取 55k，随后再划分约 50k train 和 5k development：
 
-```bash
-python - <<'PY'
-from collections import Counter
-p = "/data/geosr_static/GeoSR-static/train/spar_50k_media.txt"
-c = Counter()
-for line in open(p, encoding="utf-8"):
-    parts = line.strip().split("/")
-    c["/".join(parts[:3])] += 1
-for k, v in c.most_common():
-    print(f"{v:8d}  {k}")
-PY
-```
+~~~bash
+python scripts/sample_spar_subset.py \
+  --input /data/geosr_static/GeoSR-static/train/spar_media_complete.json \
+  --output /data/geosr_static/GeoSR-static/train/spar_probe_55k.json \
+  --media-list /data/geosr_static/GeoSR-static/train/spar_probe_55k_media.txt \
+  --manifest /data/geosr_static/manifests/spar_probe_55k_manifest.json \
+  --media-root /data/geosr_static/media \
+  --num-samples 55000 \
+  --strategy stratified \
+  --seed 0
+~~~
 
-这一步能告诉你当前子集主要来自：
+默认分层变量为：
 
-```text
-spar/scannet/...
-spar/scannetpp/...
-spar/structured3d/...
-spar/rxr/...
-```
+~~~text
+task type × data source × view-count bucket
+~~~
 
-如果某一个 source 缺失特别多，可以针对它单独处理。
+如果 media 完整样本不足 55k，脚本会直接报错。此时应明确降低样本目标，例如统一改成 30k，而不是不断更换 seed 直到得到“看起来合适”的子集。
 
-### 6. 软链接 media 到 GeoSR 训练目录
+## 5. 建立 scene-disjoint development split
 
-假设你的 GeoSR static 分支工作目录是：
+~~~bash
+python scripts/split_spar_by_scene.py \
+  --input /data/geosr_static/GeoSR-static/train/spar_probe_55k.json \
+  --train-output /data/geosr_static/GeoSR-static/train/spar_probe_train.json \
+  --val-output /data/geosr_static/GeoSR-static/train/spar_probe_dev.json \
+  --manifest /data/geosr_static/manifests/spar_probe_split_manifest.json \
+  --val-ratio 0.09 \
+  --seed 0
+~~~
 
-```bash
-/path/to/GeoSR-static
-```
+scene 数量不同，因此实际样本数不会严格等于 50k/5k。manifest 必须满足：
 
-推荐不要复制图片，使用软链接：
+~~~text
+scene_overlap = 0
+~~~
 
-```bash
-cd /path/to/CVPR
+如果脚本无法从某类路径可靠解析 scene ID，它会停止并输出示例。不要把无法识别的样本随机分到 train/dev，否则同一场景可能同时出现。
+
+此外，在正式实验前还需单独审计 SPAR train 与 VSI-Bench 的 source + scene_id 交集。若存在交集，应过滤训练场景或明确说明采用的是论文原始协议；更稳妥的主结果应使用 scene-disjoint 训练数据。
+
+## 6. 最终完整性检查
+
+~~~bash
+python scripts/check_media_availability.py \
+  --annotation /data/geosr_static/GeoSR-static/train/spar_probe_train.json \
+  --media-root /data/geosr_static/media \
+  --require-complete
+
+python scripts/check_media_availability.py \
+  --annotation /data/geosr_static/GeoSR-static/train/spar_probe_dev.json \
+  --media-root /data/geosr_static/media \
+  --require-complete
+~~~
+
+任意样本缺失 media 时，--require-complete 会返回非零状态，训练不应继续。
+
+## 7. 链接 media
+
+候选 55k 的 media 清单覆盖 train 和 development，可统一链接：
+
+~~~bash
 python scripts/link_required_media.py \
-  --media-list /data/geosr_static/GeoSR-static/train/spar_50k_media.txt \
+  --media-list /data/geosr_static/GeoSR-static/train/spar_probe_55k_media.txt \
   --source-root /data/geosr_static/media \
   --target-root /path/to/GeoSR-static/data/media \
   --mode symlink \
-  --missing-output /data/geosr_static/GeoSR-static/train/link_missing_media.txt
-```
+  --missing-output /data/geosr_static/manifests/link_missing_media.txt
+~~~
 
-然后链接 annotation：
+链接脚本会拒绝绝对路径和父目录跳转。推荐在 GeoSR dataset config 中显式填写 spar_probe_train.json 和 spar_probe_dev.json。
 
-```bash
-mkdir -p /path/to/GeoSR-static/data/train
-ln -sf /data/geosr_static/GeoSR-static/train/spar_50k.json \
-  /path/to/GeoSR-static/data/train/spar_234k.json
-```
+不要长期把 50k 文件伪装成 spar_234k.json。如果原始代码暂时只能识别固定文件名，必须在 run name 和实验 manifest 中记录真实 annotation 路径与 SHA256。
 
-这样做的好处是：GeoSR 原始代码仍然以为自己在读 `data/train/spar_234k.json`，但实际读的是你的 50k 子集。
+## 8. VSI-Bench 使用协议
 
-### 7. 第一轮建议先不用 LLaVA-Hound
+VSI-Bench 建议完整下载和解压：
 
-作者 static recipe 是：
-
-```text
-spar_234k + llava_hound_64k
-```
-
-但你的第一轮目标是验证 geometry layer，因此建议先只跑：
-
-```text
-spar_50k
-```
-
-也就是把训练脚本里的：
-
-```bash
-DATASETS="spar_234k,llava_hound_64k"
-```
-
-临时改成：
-
-```bash
-DATASETS="spar_234k"
-```
-
-这样可以避免准备 LLaVA-Hound 视频 media。
-
-### 8. 评测集 VSI-Bench
-
-VSI-Bench 建议完整下载。若 evaluator 需要解压后的目录：
-
-```bash
+~~~bash
 cd /data/geosr_static/VSI-Bench
 unzip scannet.zip
 unzip scannetpp.zip
 unzip arkitscenes.zip
-```
+~~~
 
-## 1 TB 空间建议分配
+正确使用顺序：
 
-| 组件 | 建议预算 |
-|---|---:|
-| VSI-Bench | 10-20 GB |
-| SPAR compact media | 5-20 GB |
-| 模型缓存 | 20-30 GB |
-| 训练 annotation | <10 GB |
-| 50k-100k 子集的 VGGT feature cache | 50-400 GB |
-| checkpoints / logs / eval outputs | 50-100 GB |
-| buffer | 200 GB 以上 |
+1. 先用 GeoSR 官方 checkpoint 跑一次 VSI-Bench，确认 evaluator、数据路径和指标实现正确。
+2. 在 spar_probe_dev.json 上选择 geometry layer、mask 设置和 checkpoint。
+3. 锁定配置后再运行 VSI-Bench。
+4. 不根据 VSI-Bench 分任务结果回头调整 layer 或超参数。
 
-目前看，若 SPAR compact media 覆盖率足够，真正占空间的会是后续的 VGGT 多层 feature cache，而不是原始 SPAR 图片。
+## 9. 第一阶段实验矩阵
+
+统一使用 SPAR probe train、相同训练步数和相同 seed：
+
+~~~text
+no-geometry control
+default GeoSR geometry representation
+early VGGT layer
+middle VGGT layer
+late VGGT layer
+final VGGT layer
+fixed multi-level geometry control
+~~~
+
+第一阶段只使用 SPAR 时，结果名称应写为：
+
+~~~text
+GeoSR-style SPAR-probe baseline
+~~~
+
+而不是“GeoSR reproduction”。加入完整 spar_234k + llava_hound_64k 并复现官方训练预算后，才适合讨论论文级复现误差。
+
+Layer probing 的目标不是只判断“哪个层平均分最高”，而是检查不同任务是否出现稳定的 layer preference。至少分别报告：
+
+~~~text
+depth / absolute distance / relative distance
+relative direction
+object size / room size
+route planning
+appearance order
+overall
+~~~
+
+## 10. VGGT feature cache 预算
+
+不要直接按“50k 样本 × 若干层”缓存原始 VGGT token。以 518 × 518、patch size 14、hidden size 约 2048、bf16 粗略估算：
+
+~~~text
+1369 tokens × 2048 × 2 bytes ≈ 5.6 MB / frame / layer
+~~~
+
+若平均每个样本 4 帧，50k 样本的单层原始 token 理论量级可超过 1 TB。实际值会受到重复视觉输入、token merging、帧数和存储格式影响，因此原先的 50-400 GB 不能作为默认预算。
+
+推荐顺序：
+
+1. 第一轮在线运行 VGGT，先不做全量 cache。
+2. 用 100-500 个真实样本测量平均帧数、token shape、dtype、吞吐和落盘体积。
+3. cache 以“唯一且有序的视觉输入 + preprocessing hash”为 key，而不是以 QA sample 为 key。
+4. 多个 QA 共享同一视觉输入时只保存一份 feature。
+5. 若必须缓存，优先保存选定层，并使用分片文件，避免产生几十万个小文件。
+6. 只有 projector 固定时才能安全缓存 projector 之后的表示；若 projector 参与训练，应缓存 projector 之前的 VGGT feature。
+
+## 1 TB 空间策略
+
+| 组件 | 建议 |
+|---|---|
+| VSI-Bench | 完整保留 |
+| SPAR annotation | 完整保留，体积较小 |
+| 上游 RGB media | 按许可和实际可用 source 规划，先实测 |
+| Qwen2.5-VL-7B + VGGT-1B | 单独保留一份模型快照，避免 cache 重复 |
+| VGGT feature cache | 第一阶段不做全量 cache |
+| checkpoints | 只保留关键 step 和 best-on-development |
+| buffer | 至少预留 150-200 GB |
+
+如果获得授权的上游 RGB media 本身超过预算，应缩小并固定 source 范围，而不是依赖一个并不存在的 3 GB compact-media 假设。
 
 ## 脚本清单
 
 | 脚本 | 作用 |
 |---|---|
-| `scripts/download_geosr_static_data.sh` | 下载 VSI-Bench、VG-LLM annotations、SPAR compact media、Qwen/VGGT 模型。 |
-| `scripts/extract_spar_compact_media.sh` | 解压 `rxr/scannet/scannetpp/structured3d` compact media 到数据根目录。 |
-| `scripts/sample_spar_subset.py` | 从 `spar_234k.json` 抽样，生成 `spar_50k.json` 和 media 清单。 |
-| `scripts/check_media_availability.py` | 检查 media 清单在某个根目录下的覆盖率。 |
-| `scripts/link_required_media.py` | 按 media 清单把文件软链接/硬链接/复制到 GeoSR 训练目录。 |
+| scripts/download_geosr_static_data.sh | 下载 VSI-Bench、训练 annotation 和模型，不声称下载 SPAR RGB media。 |
+| scripts/extract_spar_compact_media.sh | 检查发布包是否真的包含图片，只在安全且含图片时解压。 |
+| scripts/check_media_availability.py | 同时检查路径覆盖率和样本完整率，可输出 media-complete annotation。 |
+| scripts/sample_spar_subset.py | 从 media 完整全集做分层抽样，并保存 SHA256 和分布 manifest。 |
+| scripts/split_spar_by_scene.py | 生成 scene-disjoint train/development split。 |
+| scripts/link_required_media.py | 安全地链接、硬链接或复制经过验证的相对 media 路径。 |
 
-## 后续实验建议
+## 第一阶段完成标准
 
-第一轮只做：
+进入 geometry layer ablation 前，应同时满足：
 
-```text
-spar_50k + 完整 VSI-Bench + GeoSR-style mask/gate
-```
-
-比较：
-
-```text
-默认 VGGT 层（GeoSR 代码中是 aggregated_tokens_list[-2]）
-final VGGT 层
-middle VGGT 层
-early VGGT 层
-```
-
-如果中间层优于默认/最终层，再扩展到：
-
-```text
-spar_100k
-加入 llava_hound_64k
-预提多层 VGGT features
-2D visual token layer ablation
-```
+- 官方 checkpoint 可以在本地 VSI-Bench evaluator 上正常评测。
+- train/development scene overlap 为 0。
+- train 和 development 的 sample-level media coverage 均为 100%。
+- 所有方法读取同一 annotation SHA256。
+- 数据分布、seed、训练步数和代码 commit 已记录。
+- layer 和 checkpoint 只根据 development 选择。
+- VSI-Bench 只用于锁定配置后的最终结果。
