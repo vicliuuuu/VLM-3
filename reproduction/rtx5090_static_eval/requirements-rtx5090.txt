@@ -1,0 +1,19 @@
+# RTX 5090 compatibility overlay for GeoSR commit d2455359fcf62555eb04686e397aa1ab9393df9f.
+# Install the repository's non-GPU requirements first; see create_environment.sh.
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+
+# cp311 Linux wheel used in the verified environment. Building 2.7.4.post1
+# from the upstream GeoSR requirements is not the verified RTX 5090 path.
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
+
+# Imported by GeoSR/lmms_eval but absent from the upstream requirement file.
+tenacity==9.1.4
+hf-transfer==0.1.9
+pytablewriter==1.2.1
+
+# Keep Requests and pytablewriter's decoder dependency mutually compatible.
+chardet==5.2.0
